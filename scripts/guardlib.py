@@ -594,6 +594,13 @@ def safer_actions(command, cwd=None):
         ])
         safer_commands.append(f"git branch backup/pre-reset{branch_suffix} HEAD")
 
+    if primary == "git" and subcommand == "clean":
+        actions.extend([
+            "Preview the clean operation before deleting untracked files",
+            "Create a backup or archive if ignored files matter",
+        ])
+        safer_commands.append("git clean -ndx")
+
     if re.search(r"(?i)\b(curl|wget|invoke-webrequest|iwr)\b.*\|\s*(sh|bash|pwsh|powershell|cmd)\b", command):
         actions.extend([
             "Download the script to a file, inspect it, and verify checksum or signature before execution",
@@ -647,11 +654,18 @@ def preflight_report(command, cwd, allowed_roots):
     paths = path_findings(command, cwd, allowed_roots)
     context = context_findings(command, cwd)
 
+    display_parts = list(compound["parts"])
+    nested_command = classification.get("nested_command", "")
+    nested_compound = classify_compound_command(nested_command, nested=True) if nested_command else {"parts": [], "risk": "low", "categories": [], "reasons": []}
+    if nested_compound["parts"]:
+        display_parts = nested_compound["parts"]
+
     rollback = rollback_hints(command, cwd=cwd)
     safer = safer_actions(command, cwd=cwd)
 
-    if len(compound["parts"]) > 1:
-        for part in compound["parts"]:
+    part_sources = display_parts if display_parts else compound["parts"]
+    if len(part_sources) > 0:
+        for part in part_sources:
             for item in rollback_hints(part["command"], cwd=cwd):
                 if item not in rollback:
                     rollback.append(item)
@@ -663,15 +677,24 @@ def preflight_report(command, cwd, allowed_roots):
                 if item not in safer["commands"]:
                     safer["commands"].append(item)
 
-    risk = max_risk(classification["risk"], compound["risk"], secrets["risk"], paths["risk"], context["risk"])
+    risk = max_risk(classification["risk"], compound["risk"], nested_compound["risk"], secrets["risk"], paths["risk"], context["risk"])
 
-    categories = sorted(set(classification["categories"]) | set(compound["categories"]))
+    categories = sorted(set(classification["categories"]) | set(compound["categories"]) | set(nested_compound.get("categories", [])))
+
+    reason_groups = [classification["reasons"], compound["reasons"], secrets["reasons"], paths["reasons"], context["reasons"]]
+    if nested_compound.get("parts") and display_parts == nested_compound["parts"]:
+        reason_groups.insert(2, nested_compound.get("reasons", []))
 
     reasons = []
-    for group in (classification["reasons"], compound["reasons"], secrets["reasons"], paths["reasons"], context["reasons"]):
+    seen_reason_suffixes = set()
+    for group in reason_groups:
         for item in group:
+            suffix = item.replace("nested command: ", "")
+            if suffix in seen_reason_suffixes:
+                continue
             if item not in reasons:
                 reasons.append(item)
+                seen_reason_suffixes.add(suffix)
 
     need_approval = risk in {"high", "critical"}
 
@@ -685,7 +708,7 @@ def preflight_report(command, cwd, allowed_roots):
         "subcommand": classification["subcommand"],
         "categories": categories,
         "reasons": reasons,
-        "compound_parts": compound["parts"],
+        "compound_parts": display_parts,
         "path_findings": paths["findings"],
         "secret_findings": secrets["findings"],
         "context_findings": context["details"],
