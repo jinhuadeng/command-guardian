@@ -8,8 +8,14 @@ RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 CHAIN_OPERATORS = {"&&", "||", ";", "|"}
 SHELL_WRAPPERS = {"bash", "sh", "zsh", "pwsh", "powershell", "cmd"}
 FILE_WRITE_COMMANDS = {"rm", "del", "erase", "mv", "move-item", "cp", "copy-item", "rmdir", "remove-item", "chmod", "chown", "rsync"}
+POWERSHELL_DESTRUCTIVE_COMMANDS = {"remove-item", "move-item"}
+POWERSHELL_WRITE_COMMANDS = {"copy-item", "set-content", "out-file", "clear-content"}
+POWERSHELL_FILE_COMMANDS = POWERSHELL_DESTRUCTIVE_COMMANDS | POWERSHELL_WRITE_COMMANDS
 READ_ONLY_COMMANDS = {"cat", "type", "ls", "dir", "rg", "git", "docker", "kubectl", "terraform"}
 PACKAGE_MANAGERS = {"npm", "pnpm", "yarn", "pip", "cargo"}
+POWERSHELL_PATH_FLAGS = {"-path", "-literalpath", "-destination", "-filter", "-include", "-exclude"}
+POWERSHELL_SOURCE_FLAGS = {"-path", "-literalpath"}
+POWERSHELL_DEST_FLAGS = {"-destination"}
 
 
 def split_command(command):
@@ -188,6 +194,62 @@ def detect_nested_command(tokens):
     return ""
 
 
+def powershell_option_values(tokens, option_names):
+    values = []
+    normalized_options = {name.lower() for name in option_names}
+    for index, token in enumerate(tokens[:-1]):
+        option = normalize_token(token).lower()
+        if option in normalized_options:
+            candidate = normalize_token(tokens[index + 1])
+            if candidate and not candidate.startswith("-"):
+                values.append(candidate)
+    return values
+
+
+def powershell_file_details(tokens):
+    if not tokens:
+        return {}
+
+    primary = executable_name(tokens[0])
+    if primary not in POWERSHELL_FILE_COMMANDS | POWERSHELL_DESTRUCTIVE_COMMANDS:
+        return {}
+
+    details = {
+        "uses_recurse": any(normalize_token(token).lower() == "-recurse" for token in tokens[1:]),
+        "uses_force": any(normalize_token(token).lower() == "-force" for token in tokens[1:]),
+        "uses_literal_path": any(normalize_token(token).lower() == "-literalpath" for token in tokens[1:]),
+        "uses_path": any(normalize_token(token).lower() == "-path" for token in tokens[1:]),
+        "path_values": powershell_option_values(tokens, POWERSHELL_SOURCE_FLAGS),
+        "destination_values": powershell_option_values(tokens, POWERSHELL_DEST_FLAGS),
+    }
+
+    positional = []
+    skip_next = False
+    for index, token in enumerate(tokens[1:], start=1):
+        if skip_next:
+            skip_next = False
+            continue
+        value = normalize_token(token)
+        lowered = value.lower()
+        if lowered in POWERSHELL_PATH_FLAGS:
+            if index + 1 < len(tokens):
+                skip_next = True
+            continue
+        if value.startswith("-") or value in CHAIN_OPERATORS:
+            continue
+        positional.append(value)
+
+    if not details["path_values"]:
+        if primary in {"remove-item", "set-content", "out-file", "clear-content"} and positional:
+            details["path_values"] = [positional[0]]
+        elif primary in {"copy-item", "move-item"} and positional:
+            details["path_values"] = [positional[0]]
+            if len(positional) > 1 and not details["destination_values"]:
+                details["destination_values"] = [positional[1]]
+
+    return details
+
+
 def classify_command(command, _nested=False):
     tokens = split_command(command)
     primary = executable_name(tokens[0]) if tokens else ""
@@ -198,10 +260,35 @@ def classify_command(command, _nested=False):
 
     if primary in READ_ONLY_COMMANDS:
         categories.add("read-capable")
-    if primary in FILE_WRITE_COMMANDS:
+    if primary in FILE_WRITE_COMMANDS and primary not in POWERSHELL_FILE_COMMANDS:
         categories.update({"write", "destructive"})
         risk = "high"
         reasons.append(f"{primary} can modify or remove local files")
+
+    ps_details = powershell_file_details(tokens)
+    if primary in POWERSHELL_DESTRUCTIVE_COMMANDS:
+        categories.update({"write", "destructive"})
+        risk = max_risk(risk, "high")
+        reasons.append(f"{primary} can modify or remove local files")
+    elif primary in POWERSHELL_WRITE_COMMANDS:
+        categories.add("write")
+        risk = max_risk(risk, "medium")
+        reasons.append(f"{primary} can overwrite local file content")
+
+    if primary in POWERSHELL_FILE_COMMANDS | POWERSHELL_DESTRUCTIVE_COMMANDS:
+        if ps_details.get("uses_recurse"):
+            risk = max_risk(risk, "critical" if primary == "remove-item" else "high")
+            reasons.append(f"{primary} -Recurse expands the scope beyond a single item")
+        if ps_details.get("uses_force"):
+            risk = max_risk(risk, "high")
+            reasons.append(f"{primary} -Force bypasses normal PowerShell safety checks")
+        if ps_details.get("uses_path") and not ps_details.get("uses_literal_path"):
+            reasons.append(f"{primary} -Path may expand wildcards in PowerShell")
+        if ps_details.get("uses_literal_path"):
+            reasons.append(f"{primary} -LiteralPath narrows matching by disabling wildcard expansion")
+        if primary in {"copy-item", "move-item"} and not ps_details.get("destination_values"):
+            risk = max_risk(risk, "high")
+            reasons.append(f"{primary} destination could not be resolved from the command")
 
     if primary in PACKAGE_MANAGERS and subcommand in {"install", "add", "remove", "uninstall", "update"}:
         categories.add("write")
@@ -373,6 +460,11 @@ def extract_path_candidates(command, tokens, classification):
         "-output",
     }
     candidates = []
+    ps_details = powershell_file_details(tokens)
+
+    if primary in POWERSHELL_FILE_COMMANDS | POWERSHELL_DESTRUCTIVE_COMMANDS:
+        candidates.extend(ps_details.get("path_values", []))
+        candidates.extend(ps_details.get("destination_values", []))
 
     for index, token in enumerate(tokens):
         value = normalize_token(token)
@@ -406,6 +498,8 @@ def path_findings(command, cwd, allowed_roots):
     tokens = classification["tokens"]
     roots = [os.path.abspath(root) for root in (allowed_roots or [cwd])]
     destructive = "destructive" in classification["categories"]
+    ps_details = powershell_file_details(tokens)
+    literal_mode = bool(ps_details.get("uses_literal_path"))
     findings = []
     risk = "low"
     resolved_candidates = []
@@ -447,7 +541,7 @@ def path_findings(command, cwd, allowed_roots):
             })
             risk = max_risk(risk, "critical")
 
-        if destructive and ("*" in normalized or "?" in normalized):
+        if destructive and ("*" in normalized or "?" in normalized) and not literal_mode:
             findings.append({
                 "type": "wildcard-target",
                 "raw": raw,
@@ -560,6 +654,12 @@ def rollback_hints(command, cwd=None):
             "Capture a directory listing or archive first if the data is not reproducible",
         ])
 
+    if primary in {"copy-item", "set-content", "out-file", "clear-content"}:
+        hints.extend([
+            "Create a backup copy or commit before overwriting file content",
+            "Capture the previous file contents if the change is not trivially reproducible",
+        ])
+
     seen = []
     for hint in hints:
         if hint not in seen:
@@ -629,6 +729,12 @@ def safer_actions(command, cwd=None):
         actions.extend([
             "Resolve the exact target path first and prefer a literal path over a wildcard",
             "List the target contents before deletion or move if scope is not obvious",
+        ])
+
+    if primary in {"copy-item", "set-content", "out-file", "clear-content"}:
+        actions.extend([
+            "Resolve the exact destination path first and prefer -LiteralPath when wildcards are unintended",
+            "Create a backup or dry-run equivalent before overwriting content",
         ])
 
     if not actions and classification["risk"] in {"medium", "high", "critical"}:
