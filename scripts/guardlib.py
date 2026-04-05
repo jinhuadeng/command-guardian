@@ -219,6 +219,7 @@ def powershell_file_details(tokens):
         "uses_force": any(normalize_token(token).lower() == "-force" for token in tokens[1:]),
         "uses_literal_path": any(normalize_token(token).lower() == "-literalpath" for token in tokens[1:]),
         "uses_path": any(normalize_token(token).lower() == "-path" for token in tokens[1:]),
+        "uses_both_path_flags": any(normalize_token(token).lower() == "-path" for token in tokens[1:]) and any(normalize_token(token).lower() == "-literalpath" for token in tokens[1:]),
         "path_values": powershell_option_values(tokens, POWERSHELL_SOURCE_FLAGS),
         "destination_values": powershell_option_values(tokens, POWERSHELL_DEST_FLAGS),
     }
@@ -286,6 +287,8 @@ def classify_command(command, _nested=False):
             reasons.append(f"{primary} -Path may expand wildcards in PowerShell")
         if ps_details.get("uses_literal_path"):
             reasons.append(f"{primary} -LiteralPath narrows matching by disabling wildcard expansion")
+        if ps_details.get("uses_both_path_flags"):
+            reasons.append(f"{primary} both -Path and -LiteralPath present; -LiteralPath overrides wildcard expansion")
         if primary in {"copy-item", "move-item"} and not ps_details.get("destination_values"):
             risk = max_risk(risk, "high")
             reasons.append(f"{primary} destination could not be resolved from the command")

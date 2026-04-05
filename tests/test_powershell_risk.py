@@ -56,6 +56,12 @@ class PowerShellRiskTests(unittest.TestCase):
                 self.assertIn("write", report["categories"])
                 self.assertIn(reason, report["reasons"])
 
+    def test_both_path_and_literalpath(self):
+        report = self.report(r"Remove-Item -Path *.txt -LiteralPath file.txt")
+        self.assertIn("remove-item both -Path and -LiteralPath present; -LiteralPath overrides wildcard expansion", report["reasons"])
+        self.assertIn("remove-item -LiteralPath narrows matching by disabling wildcard expansion", report["reasons"])
+        self.assertNotIn("remove-item -Path may expand wildcards in PowerShell", report["reasons"])
+
 
 if __name__ == "__main__":
     unittest.main()
