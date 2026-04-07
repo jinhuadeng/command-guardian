@@ -120,6 +120,12 @@ def is_windows_drive_path(value):
     return bool(re.match(r"^[a-zA-Z]:([\\/]|$)", value or ""))
 
 
+def is_unc_path(value):
+    value = normalize_token(value)
+    # UNC path pattern: \\server\share or //server/share
+    return bool(re.match(r"^\\\\[^\\/]+\\[^\\/]+", value)) or bool(re.match(r"^//[^\\/]+/[^\\/]+", value))
+
+
 def is_remote_path(value):
     value = normalize_token(value).lower()
     return value.startswith(("http://", "https://", "ssh://", "git@", "s3://"))
@@ -251,6 +257,38 @@ def powershell_file_details(tokens):
     return details
 
 
+def get_kubectl_context():
+    """
+    Returns (context_name, namespace) for current kubectl configuration.
+    Returns (None, None) if kubectl not available or error.
+    """
+    try:
+        # Get current context
+        ctx_proc = subprocess.run(
+            ["kubectl", "config", "current-context"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if ctx_proc.returncode != 0:
+            return None, None
+        context = ctx_proc.stdout.strip()
+        
+        # Get namespace for current context
+        ns_proc = subprocess.run(
+            ["kubectl", "config", "view", "--minify", "-o", "jsonpath='{.contexts[0].context.namespace}'"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        namespace = ns_proc.stdout.strip().strip("'")
+        if not namespace or ns_proc.returncode != 0:
+            namespace = "default"
+        return context, namespace
+    except Exception:
+        return None, None
+
+
 def classify_command(command, _nested=False):
     tokens = split_command(command)
     primary = executable_name(tokens[0]) if tokens else ""
@@ -326,6 +364,15 @@ def classify_command(command, _nested=False):
         categories.update({"write", "production-impacting"})
         risk = max_risk(risk, "high")
         reasons.append(f"kubectl {subcommand} changes cluster state")
+        # Additional risk based on kubectl context
+        context, namespace = get_kubectl_context()
+        if context:
+            if any(prod in context.lower() for prod in ("prod", "production")):
+                risk = max_risk(risk, "critical")
+                reasons.append(f"kubectl context '{context}' appears to be production")
+            if namespace and namespace.lower() == "default":
+                risk = max_risk(risk, "high")
+                reasons.append(f"kubectl namespace is 'default' (often used for production)")
 
     if primary == "terraform" and subcommand in {"apply", "destroy"}:
         categories.update({"write", "production-impacting"})
@@ -333,6 +380,18 @@ def classify_command(command, _nested=False):
         reasons.append(f"terraform {subcommand} changes managed infrastructure")
         if subcommand == "destroy":
             risk = max_risk(risk, "critical")
+        # Detect -auto-approve flag
+        if "-auto-approve" in tokens:
+            risk = max_risk(risk, "critical")
+            reasons.append("terraform -auto-approve flag bypasses interactive confirmation")
+        # Detect -target flag
+        if "-target" in tokens:
+            risk = max_risk(risk, "high")
+            reasons.append("terraform -target flag limits scope but may cause state inconsistency")
+        # Detect -workspace flag
+        if "-workspace" in tokens:
+            risk = max_risk(risk, "medium")
+            reasons.append("terraform -workspace flag selects a non-default workspace")
 
     lowered = command.lower()
     if any(word in lowered for word in (" sudo ", " runas ", " -verb runas")) or lowered.startswith("sudo "):
@@ -500,6 +559,16 @@ def path_findings(command, cwd, allowed_roots):
     classification = classify_command(command)
     tokens = classification["tokens"]
     roots = [os.path.abspath(root) for root in (allowed_roots or [cwd])]
+    # Detect sensitive roots: git repo root and workspace root
+    sensitive_roots = []
+    git = git_context(cwd)
+    if git["in_repo"]:
+        sensitive_roots.append(os.path.abspath(git["repo_root"]))
+    workspace_root = detect_workspace_root(cwd)
+    if workspace_root:
+        sensitive_roots.append(os.path.abspath(workspace_root))
+    # Deduplicate
+    sensitive_roots = list(dict.fromkeys(sensitive_roots))
     destructive = "destructive" in classification["categories"]
     ps_details = powershell_file_details(tokens)
     literal_mode = bool(ps_details.get("uses_literal_path"))
@@ -544,7 +613,29 @@ def path_findings(command, cwd, allowed_roots):
             })
             risk = max_risk(risk, "critical")
 
-        if destructive and ("*" in normalized or "?" in normalized) and not literal_mode:
+        # Check if target is a sensitive root (git or workspace)
+        if destructive and resolved and any(os.path.abspath(resolved) == root for root in sensitive_roots):
+            findings.append({
+                "type": "sensitive-root-target",
+                "raw": raw,
+                "resolved": resolved,
+                "reason": "destructive command points at a sensitive root (git or workspace)",
+            })
+            risk = max_risk(risk, "critical")
+
+        # Check for UNC paths
+        if is_unc_path(raw):
+            findings.append({
+                "type": "unc-path",
+                "raw": raw,
+                "resolved": resolved,
+                "reason": "UNC network path may be remote",
+            })
+            risk = max_risk(risk, "medium")
+
+        # Enhanced wildcard detection
+        wildcard_patterns = ["*", "?", "**"]
+        if destructive and any(pattern in normalized for pattern in wildcard_patterns) and not literal_mode:
             findings.append({
                 "type": "wildcard-target",
                 "raw": raw,
@@ -579,6 +670,64 @@ def git_context(cwd):
         }
 
 
+def detect_workspace_root(cwd):
+    """
+    Walk up from cwd to find a workspace root.
+    Returns absolute path if found, else None.
+    """
+    current = os.path.abspath(cwd)
+    while True:
+        # Check for .openclaw directory
+        if os.path.isdir(os.path.join(current, ".openclaw")):
+            return current
+        # Check for AGENTS.md file (OpenClaw workspace)
+        if os.path.isfile(os.path.join(current, "AGENTS.md")):
+            return current
+        # Check for SOUL.md file
+        if os.path.isfile(os.path.join(current, "SOUL.md")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
+def terraform_context(cwd):
+    try:
+        # Check for .terraform directory
+        terraform_dir = os.path.join(cwd, ".terraform")
+        in_terraform = os.path.isdir(terraform_dir)
+        workspace = ""
+        has_state = False
+        if in_terraform:
+            # Read workspace from .terraform/environment
+            env_file = os.path.join(terraform_dir, "environment")
+            if os.path.isfile(env_file):
+                with open(env_file, "r") as f:
+                    workspace = f.read().strip()
+            # Check for terraform.tfstate
+            state_file = os.path.join(cwd, "terraform.tfstate")
+            if os.path.isfile(state_file):
+                has_state = True
+            else:
+                # Check in .terraform directory
+                state_file2 = os.path.join(terraform_dir, "terraform.tfstate")
+                if os.path.isfile(state_file2):
+                    has_state = True
+        return {
+            "in_terraform_dir": in_terraform,
+            "workspace": workspace,
+            "has_state": has_state,
+        }
+    except Exception:
+        return {
+            "in_terraform_dir": False,
+            "workspace": "",
+            "has_state": False,
+        }
+
+
 def context_findings(command, cwd):
     classification = classify_command(command)
     primary = classification["primary_command"]
@@ -597,6 +746,17 @@ def context_findings(command, cwd):
             if git_info["dirty"] and subcommand in {"reset", "clean", "checkout", "restore", "rebase"}:
                 risk = max_risk(risk, "high")
                 reasons.append("git working tree has uncommitted changes")
+    if primary == "terraform":
+        terra_info = terraform_context(cwd)
+        details["terraform"] = terra_info
+        if terra_info["in_terraform_dir"]:
+            if terra_info["workspace"] and terra_info["workspace"] != "default":
+                risk = max_risk(risk, "medium")
+                reasons.append("terraform workspace is '{}' (non‑default)".format(terra_info["workspace"]))
+            if terra_info["has_state"]:
+                risk = max_risk(risk, "medium")
+                reasons.append("terraform state file present")
+
     return {"risk": risk, "reasons": reasons, "details": details}
 
 
