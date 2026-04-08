@@ -483,8 +483,12 @@ def find_secret_findings(command):
         ("aws_access_key", r"\b(AKIA[0-9A-Z]{16})\b", "critical"),
         ("github_pat", r"\b(gh[pousr]_[A-Za-z0-9]{20,})\b", "critical"),
         ("openai_key", r"\b(sk-[A-Za-z0-9]{20,})\b", "critical"),
+        ("basic_auth", r"(?i)\bBasic\s+([A-Za-z0-9+/=]{10,})", "critical"),
         ("generic_secret", r"(?i)\b(api[_-]?key|token|password|passwd|secret)\s*[:=]\s*([^\s'\"`]+)", "high"),
         ("cookie", r"(?i)\bcookie\s*[:=]\s*([^\s]+)", "high"),
+        ("query_secret", r"(?i)[?&](api[_-]?key|token|password|passwd|secret)=([^&\s'\"`]+)", "high"),
+        ("session_cookie", r"(?i)\b(session(?:id)?|phpsessid|sid|csrf[_-]?token)=([^\s;,'\"`]+)", "high"),
+        ("env_secret", r"(?i)\b(SECRET[_-]?KEY|PRIVATE[_-]?KEY|DATABASE[_-]?URL|AWS[_-]?SECRET[_-]?ACCESS[_-]?KEY|SECRET|API[_-]?KEY|TOKEN|PASSWORD|PASSWD)=([^\s'\"`]+)", "high"),
     ]
 
     findings = []
