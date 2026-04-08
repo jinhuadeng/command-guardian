@@ -1,5 +1,7 @@
 ---
 name: command-guardian
+slug: command-guardian
+version: 1.4.0
 description: Preflight safety guard for shell and infrastructure commands. Use before running commands that delete, overwrite, move, deploy, rewrite git history, change permissions, use shell wrappers like bash -c or powershell -Command, chain multiple commands with &&/||/; or may expose inline secrets. Especially for shell, git, docker, kubectl, terraform, npm, curl, wget, rsync, chmod, chown, and PowerShell file operations.
 metadata: {"openclaw":{"requires":{"anyBins":["python","python3","py"]}}}
 ---
